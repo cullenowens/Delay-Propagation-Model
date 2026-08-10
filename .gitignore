@@ -1,0 +1,11 @@
+.env
+
+raw_data/
+import_processing/raw_data/
+
+*.db
+*.duckdb
+*.dat
+
+.venv/
+.DS_Store
