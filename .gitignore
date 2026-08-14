@@ -9,3 +9,12 @@ import_processing/raw_data/
 
 .venv/
 .DS_Store
+
+# Local pipeline artifacts — regenerate with import_processing scripts, never commit
+*.duckdb
+!app/map_data.duckdb
+
+airports_raw.dat
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
