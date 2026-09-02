@@ -1,0 +1,361 @@
+DELAY-PROPAGATION PREDICTION: CONDITIONAL MONTE CARLO + MULTI-LEG PATH SIMULATOR
+=================================================================================
+(Planning document — not yet implemented. Review and revise before building.)
+
+
+CONTEXT / WHY THIS CHANGE
+--------------------------
+The pipeline currently DESCRIBES delay propagation historically: airport_stats
+and route_stats report the AVERAGE effect a turn or a route has had on delay,
+and flights_propagation already carries the raw ingredients (prev_arr_delay,
+node_effect, edge_effect_delay, scheduled_buffer, empirical_min_turn_min) that
+connect one leg's lateness to the next leg's lateness for a given tail number.
+
+What's missing is PREDICTION: given an assumed inbound delay, what actually
+happens next isn't a single number ("+5 min becomes +5 min") — historically it
+fans out into a range (might absorb back to on-time, might amplify to +15 due
+to knock-on/congestion effects). The goal is to:
+
+  1. Model that fan-out per airport/route instead of collapsing it to an
+     average.
+  2. Let a user build an arbitrary hypothetical multi-leg path (e.g.
+     ATL -> SAF -> LAX -> LGA — not necessarily a real tail's rotation) and
+     see a predicted delay DISTRIBUTION at each stop, chaining node effects
+     (ground/turn) and edge effects (in-air) leg by leg.
+
+DECISIONS ALREADY MADE (do not re-litigate without reason):
+  - Modeling approach: EMPIRICAL CONDITIONAL MONTE CARLO. Resample from real
+    historical outcomes, bucketed by inbound-delay size and airport/route
+    identity — not a fitted ML model. No new heavy dependency, stays
+    interpretable, and produces distributions (not points) for free.
+  - Congestion / time-of-day effects are DEFERRED to a later phase. V1
+    conditions only on inbound-delay magnitude and airport/route identity.
+    The design leaves room to add a time dimension later without a rewrite.
+  - UI lives INSIDE the existing app/app.py as a new tab, following its
+    existing staged-filter / session_state conventions.
+  - Starting condition is USER-SPECIFIED (on-time, or an assumed initial
+    delay) — the simulator does not also model the first leg's own
+    departure delay.
+  - Mechanistic queueing/capacity simulation (shared runway/gate resources,
+    cross-aircraft interaction) is explicitly OUT OF SCOPE for this plan —
+    it needs operational data this BTS-based pipeline doesn't have, and
+    would be a separate, larger project if pursued later.
+
+Verified against the live data: bucketing flights_propagation by inbound-delay
+size into 5 fixed-width buckets (on_time_or_early, 1_15, 16_30, 31_60, 60_plus)
+gives healthy per-airport sample sizes (12-24% of airport x bucket combos fall
+below a 30-sample threshold and need network-wide fallback). Per-route combos
+are much thinner (18-48% need fallback) — the fallback path is a CORE part of
+normal operation, not a rare edge case, since most hypothetical user-built
+paths will include at least one route DL/UA didn't actually fly.
+
+
+1. NEW PIPELINE STAGE — import_processing/build_delay_distributions.py
+------------------------------------------------------------------------
+Runs after build_propogation.py, before build_map_export.py. Same style as
+its siblings: constants with rationale comments, CREATE OR REPLACE TABLE ...
+AS <SQL> (idempotent), a main() with a RuntimeError guard if
+flights_propagation doesn't exist yet, and printed row-count/sanity output.
+
+Constants:
+
+    DB_PATH = Path("flights.duckdb")
+
+    # Fixed-width bins (not quantile bins) so a bucket's meaning is stable as
+    # new months are added — a quantile boundary would silently shift on
+    # every re-run.
+    DELAY_BUCKETS = [
+        ("on_time_or_early", None, 0),
+        ("1_15",              1,   15),
+        ("16_30",             16,  30),
+        ("31_60",             31,  60),
+        ("60_plus",           61,  None),
+    ]
+
+    # A resampled distribution needs more support than a single percentile
+    # estimate (MIN_TURN_SAMPLE_THRESHOLD=10 in build_propogation.py is fine
+    # for one number; too thin for a resampled histogram's shape). 30 is the
+    # standard "large enough" cutoff.
+    MIN_BUCKET_SAMPLE_THRESHOLD = 30
+
+    # Reservoir-sample cap per (key, bucket): Monte Carlo resampling doesn't
+    # need the full population — a few hundred real draws already reproduce
+    # the shape — and capping keeps flights.duckdb and the exported
+    # map_data.duckdb bounded regardless of how much data gets added later.
+    MAX_STORED_SAMPLES = 200
+
+A shared _bucket_case_sql(column) helper builds the bucket CASE expression
+once, used identically for node and edge queries — this is what makes adding
+a future grouping key (e.g. hour-of-day) a matter of adding one more helper +
+GROUP BY key, not restructuring.
+
+Tables produced:
+
+  - network_node_delay_distributions (5 rows) — network-wide fallback pool.
+    Columns: inbound_bucket, bucket_low, bucket_high, network_sample_size,
+    dep_delay_samples INTEGER[] (reservoir-capped DepDelayMinutes values).
+
+  - node_delay_distributions — full grid, every known airport (from
+    airport_stats) x every bucket (CROSS JOIN, so downstream lookups never
+    hit a missing row). Columns: airport, inbound_bucket, bucket_low,
+    bucket_high, airport_sample_size, is_fallback, dep_delay_samples
+    INTEGER[] — dep_delay_samples is PRE-BLENDED: the airport's own capped
+    sample if airport_sample_size >= MIN_BUCKET_SAMPLE_THRESHOLD, else the
+    matching network row's sample. Source rows: same universe as
+    airport_stats (flights_propagation WHERE node_effect IS NOT NULL AND
+    is_overnight_turn = FALSE), bucketed by prev_arr_delay, sampling
+    DepDelayMinutes.
+
+  - network_edge_delay_distributions / edge_delay_distributions — same
+    shape, keyed by (origin, dest, dep_bucket) over the full grid of every
+    observed route x 5 buckets (source: same universe as route_stats, i.e.
+    all of flights_propagation, bucketed by this leg's own DepDelayMinutes,
+    sampling ArrDelayMinutes). Use LOWERCASE origin/dest column names to
+    match the existing exported convention in route_stats/route_arcs
+    (source SQL aliases Origin AS origin, Dest AS dest), even though
+    flights_propagation itself uses Origin/Dest.
+
+Reservoir sampling via the same ROW_NUMBER() OVER (PARTITION BY ... ORDER BY
+random()) + filter pattern already idiomatic in this codebase's CTE style;
+cast samples to INTEGER (BTS delays are whole minutes) to halve stored bytes.
+
+main() prints, per bucket, the fallback rate (SUM(is_fallback)/COUNT(*)) for
+both node and edge tables — this doubles as the first regression check
+(see section 6).
+
+README update: insert build_delay_distributions.py as step 4 of 5 in the run
+order, and add the four new table names to the "safe to re-run" note.
+
+
+2. EXPORT ARTIFACT — extend import_processing/build_map_export.py
+------------------------------------------------------------------------
+Add the four new tables to `required` and copy them straight into
+map_data.duckdb alongside airport_points/route_arcs (no join needed, they're
+already keyed correctly):
+
+    required = {"airport_stats", "route_stats", "airport_timezones",
+                "node_delay_distributions", "edge_delay_distributions",
+                "network_node_delay_distributions",
+                "network_edge_delay_distributions"}
+    ...
+    out.execute("CREATE TABLE node_delay_distributions AS SELECT * FROM node_dist_df")
+    out.execute("CREATE TABLE edge_delay_distributions AS SELECT * FROM edge_dist_df")
+    out.execute("CREATE TABLE network_node_delay_distributions AS SELECT * FROM network_node_dist_df")
+    out.execute("CREATE TABLE network_edge_delay_distributions AS SELECT * FROM network_edge_dist_df")
+
+No raw per-flight/tail rows ever leave flights.duckdb — only already-
+aggregated, already-capped sample arrays. Rough size estimate: ~165 airports
+x 5 buckets + ~2,100 routes x 5 buckets, each holding <=200 4-byte ints =>
+low-single-digit-MB addition to the current ~800KB file. Confirm against the
+printed size_kb after the first real build; shrink MAX_STORED_SAMPLES if it
+balloons.
+
+
+3. MONTE CARLO PATH-SIMULATION ENGINE — app/path_simulation.py (new module)
+------------------------------------------------------------------------
+Lives in app/ (not import_processing/) because it must be importable by the
+deployed app, which is a self-contained folder with no shared packaging. It
+takes plain dict/array arguments rather than owning a DB connection, so it's
+independently testable.
+
+    import numpy as np
+    from dataclasses import dataclass
+    from typing import Literal
+
+    DELAY_BUCKETS = [...]   # duplicated from build_delay_distributions.py on
+                             # purpose — app/ must not import import_processing/
+    N_DRAWS_DEFAULT = 2000
+
+    def bucket_for(delay_minutes: float) -> str: ...
+
+    @dataclass
+    class StopResult:
+        airport: str
+        origin: str
+        arr_delay_draws: np.ndarray
+        used_route_fallback: bool
+
+    def simulate_path(
+        path: list[str],
+        start_condition: float | Literal["on_time"],
+        node_lookup: dict[tuple[str, str], np.ndarray],
+        edge_lookup: dict[tuple[str, str, str], np.ndarray],
+        network_node_lookup: dict[str, np.ndarray],
+        network_edge_lookup: dict[str, np.ndarray],
+        n_draws: int = N_DRAWS_DEFAULT,
+        seed: int | None = None,
+    ) -> list[StopResult]: ...
+
+    def summarize(result: StopResult, thresholds=(15, 30, 60)) -> dict: ...
+
+ALGORITHM, per call:
+  1. dep_draws = an array of n_draws copies of 0 (on-time) or the user's
+     assumed starting delay.
+  2. For each consecutive (origin, dest) pair in the path:
+       - EDGE STEP: bucket each value in dep_draws (draws may already span
+         multiple buckets from a prior hop); for each bucket group, resample
+         from edge_lookup[(origin, dest, bucket)], falling back to
+         network_edge_lookup[bucket] if that route/bucket combo is absent —
+         the EXPECTED common case for a hypothetical path, not an error.
+         rng.choice(pool, size=len(group), replace=True).
+       - Record StopResult(airport=dest, origin=origin,
+         arr_delay_draws=..., used_route_fallback=...).
+       - NODE STEP (if dest isn't the last stop): same group-and-resample
+         against node_lookup[(dest, bucket)] / network_node_lookup[bucket],
+         producing the next dep_draws.
+  3. Return one StopResult per hop (len(path) - 1 total).
+
+Vectorized by bucket group (<=5 rng.choice calls per hop) — a full path at
+n_draws=2000 is effectively instant.
+
+VALIDATION ASYMMETRY (important):
+  - Airports are validated against the known node universe at input time —
+    reject unknown codes immediately in the UI; there's no sensible fallback
+    for "we've never seen this airport."
+  - Routes may be entirely novel — that's the point of the feature. Fall
+    back to network_edge_lookup, never error, and surface
+    used_route_fallback=True.
+
+
+4. UI ADDITIONS — app/app.py
+------------------------------------------------------------------------
+Wrap the existing dashboard in a top-level st.tabs, extracting the current
+main() body into render_map_page():
+
+    def main():
+        ...
+        page_map, page_sim = st.tabs(["Delay Map", "Flight Path Simulator"])
+        with page_map:
+            render_map_page(airports, routes)
+        with page_sim:
+            render_path_simulator(node_lookup, edge_lookup,
+                                   network_node_lookup, network_edge_lookup,
+                                   known_airports)
+
+New cached loader parallel to load_data():
+
+    @st.cache_data
+    def load_distributions():
+        con = get_connection()
+        node_df = con.execute("SELECT * FROM node_delay_distributions").df()
+        edge_df = con.execute("SELECT * FROM edge_delay_distributions").df()
+        net_node_df = con.execute("SELECT * FROM network_node_delay_distributions").df()
+        net_edge_df = con.execute("SELECT * FROM network_edge_delay_distributions").df()
+        node_lookup = {(r.airport, r.inbound_bucket): np.asarray(r.dep_delay_samples) for r in node_df.itertuples()}
+        edge_lookup = {(r.origin, r.dest, r.dep_bucket): np.asarray(r.arr_delay_samples) for r in edge_df.itertuples()}
+        network_node_lookup = {r.inbound_bucket: np.asarray(r.dep_delay_samples) for r in net_node_df.itertuples()}
+        network_edge_lookup = {r.dep_bucket: np.asarray(r.arr_delay_samples) for r in net_edge_df.itertuples()}
+        return node_lookup, edge_lookup, network_node_lookup, network_edge_lookup
+
+render_path_simulator() reuses the existing staged-filter convention
+(applied_* vs *_input keys, same as applied_min_turns/min_turns_input):
+  - st.text_input for the path (comma/arrow-separated airport codes),
+    validated against known_airports = {a for a, _ in node_lookup}; unknown
+    codes shown via st.error and block simulation — mirrors the existing
+    "no matches" st.warning/st.stop pattern.
+  - st.radio("Starting condition", ["On-time", "Assume a delay"]) +
+    conditional st.number_input for minutes late.
+  - Optional st.expander("Advanced"): n_draws slider, optional fixed-seed
+    checkbox.
+  - st.button("Simulate", type="primary") copies inputs into applied_*,
+    calls simulate_path, stores results in st.session_state["sim_results"],
+    reruns.
+  - Rendering reads st.session_state["sim_results"] (not live widgets),
+    builds a long-format DataFrame (stop_order, airport, p10, p50, p90,
+    prob_exceed_15, is_fallback), and shows:
+      * An Altair fan chart (mark_area for p10-p90 band, mark_line/
+        mark_point for median, ordinal x-axis of stops) — the standard
+        idiom for growing uncertainty along a sequence, with tooltips
+        carrying exact values and a visible "network-wide estimate used"
+        note on fallback hops (same transparency the app already gives
+        min_turn_is_fallback).
+      * A plain st.dataframe below with exact per-stop numbers, matching
+        the existing Airports/Routes table convention.
+      * If avoiding a new dependency is preferred, st.line_chart on the
+        p10/p50/p90 columns is a lower-effort fallback (three lines, no
+        filled band).
+
+
+5. DEPENDENCIES
+------------------------------------------------------------------------
+No ML libraries needed — confirmed nothing beyond duckdb, pandas, and numpy
+is required for bucketing/reservoir sampling/resampling.
+
+app/requirements.txt additions:
+  - numpy>=1.24 — already installed transitively via pandas; pin explicitly
+    now that path_simulation.py imports it directly, matching this repo's
+    convention of pinning everything actually imported.
+  - altair>=5.0 — the one new DECLARED dependency; already bundled
+    transitively by Streamlit >=1.38 (confirmed present in the dev venv),
+    so this is pin-only with no new install risk on Streamlit Community
+    Cloud.
+
+import_processing/build_delay_distributions.py needs only duckdb, consistent
+with its siblings.
+
+
+6. VERIFICATION
+------------------------------------------------------------------------
+Pipeline stage:
+  1. Fallback-rate sanity printed by main() — sanity-check against the
+     ~12-24% (node) / ~18-48% (edge) rates already measured directly from
+     live data; a wildly different rate (>90% or 0%) signals a broken
+     join/grouping key.
+  2. Reservoir-fidelity spot check: for one high-volume (airport, bucket)
+     combo (e.g. ATL, on_time_or_early), compare the capped sample's
+     mean/median against a direct AVG/MEDIAN over the same filter on
+     flights_propagation — should track closely.
+  3. CALIBRATION BACKTEST — new script
+     import_processing/verify_delay_distributions.py: sample ~200 real
+     multi-leg (Tail_Number, operating_day) rotations from
+     flights_propagation, replay each rotation's actual airport sequence
+     and actual leg-1 DepDelayMinutes through simulate_path() (imported via
+     sys.path.insert(..., "app"), exercising the real app code), and check
+     what fraction of the time the tail's ACTUAL observed delay at each
+     subsequent stop fell inside the simulated [p10, p90] band — should
+     land near 80% if well-calibrated, broken down by hop position/bucket
+     to catch any badly-off combination.
+
+UI, manual end-to-end:
+  1. pip install -r app/requirements.txt, streamlit run app/app.py.
+  2. Confirm the existing "Delay Map" tab is unchanged after the st.tabs
+     restructuring (staged filters, Go/Clear, table focus all still work).
+  3. "Flight Path Simulator": run a common corridor (e.g. ATL, ORD, LGA)
+     on-time — expect a clean fan chart, no fallback badges.
+  4. Run a path with an unlikely/rare DL/UA route — expect a visible
+     fallback note on that hop, no crash.
+  5. Type an airport code absent from the dataset — expect inline
+     validation blocking Simulate, no crash.
+  6. Re-run with "Assume a delay = 45 minutes" for leg 1 — expect the first
+     hop's band to shift materially higher than the on-time run (45 min
+     falls in 31_60 vs on_time_or_early).
+
+
+7. EXPLICITLY OUT OF SCOPE (flagged for later, not part of this plan)
+------------------------------------------------------------------------
+  - CONGESTION / TIME-OF-DAY EFFECTS: mechanically an extension of
+    _bucket_case_sql/DELAY_BUCKETS (add an hour-of-day or daypart key), but
+    multiplies bucket combos ~24x, pushing most airport/route x delay x
+    hour combos below the sample threshold — would need a multi-level
+    fallback hierarchy (route+hour -> route -> network) instead of today's
+    single level, plus a decision on local-vs-UTC hour (reusing
+    flight_enrichment.py's timezone data). A real follow-up project, not a
+    small addition.
+  - MECHANISTIC QUEUEING/NETWORK-CAPACITY SIMULATION: modeling shared
+    runway/gate resources and cross-aircraft interaction (this flight's
+    delay affecting OTHER aircraft, not just its own next leg) is a
+    different modeling paradigm entirely (discrete-event/agent-based
+    simulation, e.g. simpy) requiring operational data (runway throughput,
+    ATC ground-delay programs) the BTS on-time performance dataset doesn't
+    contain. Out of scope here.
+
+
+FILES TOUCHED
+------------------------------------------------------------------------
+  - import_processing/build_delay_distributions.py   (new)
+  - import_processing/build_map_export.py            (extend)
+  - import_processing/verify_delay_distributions.py  (new, verification only)
+  - app/path_simulation.py                           (new)
+  - app/app.py                                        (extend: new tab, new loader)
+  - app/requirements.txt                              (add numpy, altair pins)
+  - README.md                                          (pipeline run-order update)
